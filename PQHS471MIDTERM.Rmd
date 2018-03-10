@@ -1,0 +1,275 @@
+---
+title: "PQHS 471 Mid Term"
+author: "Youjun Li"
+date: "March 09, 2018"
+output:
+  html_document: 
+    code_folding: hide
+    toc: TRUE
+    toc_float: TRUE
+    number_sections: FALSE
+  pdf_document:
+    number_sections: yes
+geometry: margin=1.75in
+fontsize: 11pt
+documentclass: article
+---
+```{r,echo=F,warning=F}
+library(knitr)
+options(width=50)
+opts_chunk$set(tidy.opts=list(width.cutoff=50),tidy=T,message=F, warning=F)
+
+```
+
+# EDA 
+## Preparation
+```{r}
+load("471midterm.RData")
+library(caret)
+library(randomForest)
+library(skimr)
+library(tidyverse)
+library(rpart)
+library(FactoMineR)
+library(gridExtra)
+tr=read.csv('census_train.csv', header=T, strip.white=T)
+te=read.csv('census_test.csv', header=T, strip.white=T)
+```
+Trainning and testing datasets are loaded with names called `tr` and `te` respectively.
+
+## Exploratory and Visualization on training set
+```{r}
+names(tr)
+tr=tr[,-c(3,5)]
+#missing is coded as "?"
+skim(tr)
+```
+Two of the variables got deleted immediately. They are `fnlwgt` and `education.num`. The first one is defined as an estimate of the number of units in the target population that the responding unit represents. Since I will only be focusing on this datset itself rather than trying to generalizing to the US population, it is OK to drop it. The latter is essentially the same as `education`, but with numerical levels that can be ordered. Ordered factor in this case won't be much of a help, hence, I choose to keep `education`. 
+
+From the `skim` function it is easy to see that some of the factor variables have a level of `"?"` which is clearly an indication of missing. I'm replacing it by `NA` for convenience.
+```{r}
+tr[,c(2,5,12)]=as.data.frame(apply(tr[,c(2,5,12)], 2, function(x) replace(x, x %in% "?", NA)))
+```
+
+Good news is there is no missing in the outcome: `income` and all the numerical variables. Here are some plots for the numerical variables to examine if there is a group mean difference for that variable between low income and high income. T-tests were also performed as complement.
+```{r}
+p1=ggplot(tr, aes(x = income, y = age, fill = income)) + geom_boxplot()
+p2=ggplot(tr, aes(x = income, y = hours.per.week, fill = income)) + geom_boxplot()
+p3=ggplot(tr, aes(x = income, y = capital.gain, fill = income)) + geom_boxplot()
+p4=ggplot(tr, aes(x = income, y = capital.loss, fill = income)) + geom_boxplot()
+grid.arrange(p1,p2,p3,p4, ncol=2, nrow = 2)
+```
+
+They all look differently by income, and t-tests confirmed that as well, given that the distributions of capital gain/loss are very skewed. I will include them all in model fitting.
+
+## Factor grouping
+Some categorical variables have many categories that will cost many degrees of freedom. Moreover, one category can have too few subjects. It is reasonable to group some of the categories.
+
+### Grouping of `workclass`
+```{r}
+tr$workclass=fct_recode(tr$workclass,  unemp='Never-worked', unemp='Without-pay', gov='Federal-gov', gov='Local-gov', gov='State-gov')
+summary(tr$workclass)
+```
+I grouped subjects that are employed by the government. And since there are very few subjects in `"Never-worked"` and `"without-pay"`, I put them into one level called `"unemp"` for unemployed.
+
+### Grouping of `occupation`
+```{r}
+tr$occupation=fct_recode(tr$occupation, skill='Craft-repair', skill='Machine-op-inspct', skill='Protective-serv',
+             labor='Farming-fishing', labor='Handlers-cleaners', labor='Priv-house-serv', labor='Transport-moving',
+             prof='Adm-clerical', prof='Exec-managerial', prof='Prof-specialty', prof='Sales', prof='Tech-support',
+             other='Armed-Forces', other='Other-service')
+summary(tr$occupation)
+```
+It got a bit tricky grouping this variable as the categories are very discrete and the appoximate salary level of some categories are very unclear to me, even after googling. So I came up with an idea of grouping by the nature of the job: ones require physical labor, basically anyone can do; ones require special skills that don't necessarily come with a degree; ones require a certain level of degree to be able to handle; ones that don't fit into any of the aboves.  
+
+### Grouping of `education`
+```{r}
+tr$education=fct_recode(tr$education, preHS='Preschool', preHS='10th', preHS='11th', preHS='12th', 
+                        preHS='1st-4th', preHS='5th-6th', preHS='7th-8th', preHS='9th',
+                        assoc='Assoc-acdm', assoc='Assoc-voc')
+summary(tr$education)
+```
+`education` is another variable that has too many levels that could be treated as one, i.e. those elementary levels that don't play too much of a role in determining how much one makes. 
+
+### Grouping of `marital.status`
+```{r}
+tr$marital.status=fct_recode(tr$marital.status, married='Married-AF-spouse', married='Married-civ-spouse',
+             alone='Married-spouse-absent', alone='Separated', alone='Widowed')
+summary(tr$marital.status)
+```
+It is ambiguous how they distinguish people that are married but their spouse doesn't live in the household and people that live separately with their spouse. Along with the widowed, they all seem to be married but live alone in terms of spouse. So I grouped these people together. I also grouped  `"Married-AF-spouse"` and `"Married-civ-spouse"` as there are very few subjects in the former category. 
+
+### Grouping of `race`
+```{r}
+tr$race=fct_recode(tr$race, minort='Amer-Indian-Eskimo', minort='Other')
+summary(tr$race)
+```
+`"Amer-Indian-Eskimo"` and `"Other"` are grouped as minority.
+
+### The use of `relationship`
+```{r}
+table(tr$marital.status, tr$relationship)
+tr$relationship=fct_recode(tr$relationship, nochild='Husband', nochild='Not-in-family', nochild='Other-relative', nochild='Unmarried', nochild='Wife')
+summary(tr$relationship)
+```
+The meaning of this variable is not that clear, so I first take a look at the table of it and `"marital.status"`. The table suggests this variable doesn't really contain much additional information than marital status in the sense that most married people will be in a family and so on. And the categories of `"Husband"` and `"Wife"` look like duplicates of `sex`. The only additional information it has is whether one subject is living with child. So I grouped the ones without child together, making this variable more of a variable for having child or not.
+
+### Removal of `native.country`
+```{r}
+ggplot(tr, aes(x = native.country, y = ..count..)) +
+  geom_bar(aes(fill = race), position = "dodge") + theme(axis.text.x = element_text(angle = 90, hjust = 1))
+#delete country variable
+tr=tr[,-12]
+```
+First of all, this variable has way too many levels and from the plot we can see the majority are from the US. Then if I group the countries by factors like continents, it seems a little redundant as we already have `race`. So I just decided to drop it. Plus it will get rid of some missing values it has. 
+
+# Random Forest with training set 
+## Complete Cases
+### Data splitting
+```{r}
+#complete cases
+trcmp=na.omit(tr)
+(nrow(tr)-nrow(trcmp))/nrow(tr)
+#split into training and testing datasets
+set.seed(621)
+splt.cmp=createDataPartition(trcmp$income,p=0.7,list = F)
+#training
+trcmp1=trcmp[splt.cmp,]
+#testing
+trcmp2=trcmp[-splt.cmp,]
+```
+A little bit more than $5\%$ of the data are missing, that's not too bad. $70\%$ of the training data will be further partitioned for the model training.
+
+### Random forest with random searching for $m$
+```{r}
+#define traincontrol
+cntrl=trainControl(method="repeatedcv",number=10, repeats = 5, search="random")
+
+#fit.cmp=train(x=trcmp1[,1:11],y=trcmp1$income, method="rf",trControl=cntrl,tuneLength=10)
+
+print(fit.cmp)
+plot(fit.cmp)
+
+yhat.cmp=predict(fit.cmp, newdata = trcmp2)
+confusionMatrix(data = yhat.cmp, trcmp2$income)
+varImp(fit.cmp, scale=FALSE)
+#mse
+mean((as.numeric(yhat.cmp) - as.numeric(trcmp2$income))^2) 
+```
+After a 10-fold cross validation repeated five times, $m$ is selected to be $2$ with $0.86$ accuracy. The testing accuracy is $0.866$. The $MSE$ is $0.134$.
+
+## With imputation
+### Impute two categorical variables by `rpart`
+```{r}
+#impute workclass
+imputwkcls=rpart(workclass ~ ., data = tr[!is.na(tr$workclass), ], method = "class")
+tr$workclass[is.na(tr$workclass)]=predict(imputwkcls, tr[is.na(tr$workclass), ], type = "class")
+summary(tr$workclass)
+#impute occupation
+imputoccp=rpart(occupation ~ ., data = tr[!is.na(tr$occupation), ], method = "class")
+tr$occupation[is.na(tr$occupation)]=predict(imputoccp, tr[is.na(tr$occupation), ], type = "class")
+summary(tr$occupation)
+```
+
+### Data splitting
+```{r}
+#split data
+set.seed(621)
+splt.tr=createDataPartition(tr$income,p=0.7,list = F)
+#training
+tr1=tr[splt.tr,]
+#testing
+tr2=tr[-splt.tr,]
+```
+Similar strategy: $70\%$ of the imputed data goes to training.  
+
+### Random forest with random searching for $m$
+```{r}
+#fit.imp=train(x=tr1[,1:11],y=tr1$income, method="rf",trControl=cntrl, tuneLength=10)
+
+print(fit.imp)
+plot(fit.imp)
+
+yhat.imp=predict(fit.imp, newdata = tr2)
+confusionMatrix(data = yhat.imp, tr2$income)
+varImp(fit.imp, scale=FALSE)
+#mse
+mean((as.numeric(yhat.imp) - as.numeric(tr2$income))^2) 
+```
+After a 10-fold cross validation repeated five times, $m$ is selected to be $3$ with $0.86$ accuracy. The testing accuracy is $0.872$. The $MSE$ is $0.128$. It looks like there is a minor improvement with imputation. However, the difference is too small, not significant enough for me rule one out. So I will use both complete and imputed models to predict the final testing set and compare.
+
+
+# Random Forest with testing set
+## Same procedure as the training set
+```{r}
+te=read.csv('census_test.csv', header=T, strip.white=T)
+#delete sample weights and education level
+te=te[,-c(3,5)]
+#missing is coded as "?"
+skim(te)
+#change "?" to NA
+te[,c(2,5,12)]=as.data.frame(apply(te[,c(2,5,12)], 2, function(x) replace(x, x %in% "?", NA)))
+
+#goup some factors that have multiple levels
+#workclass
+te$workclass=fct_recode(te$workclass,  unemp='Never-worked', unemp='Without-pay', gov='Federal-gov', gov='Local-gov', gov='State-gov')
+summary(te$workclass)
+#occupation
+te$occupation=fct_recode(te$occupation, skill='Craft-repair', skill='Machine-op-inspct', skill='Protective-serv',
+                         labor='Farming-fishing', labor='Handlers-cleaners', labor='Priv-house-serv', labor='Transport-moving',
+                         prof='Adm-clerical', prof='Exec-managerial', prof='Prof-specialty', prof='Sales', prof='Tech-support',
+                         other='Armed-Forces', other='Other-service')
+summary(te$occupation)
+#education
+te$education=fct_recode(te$education, preHS='Preschool', preHS='10th', preHS='11th', preHS='12th', 
+                        preHS='1st-4th', preHS='5th-6th', preHS='7th-8th', preHS='9th',
+                        assoc='Assoc-acdm', assoc='Assoc-voc')
+summary(te$education)
+#marital status
+te$marital.status=fct_recode(te$marital.status, married='Married-AF-spouse', married='Married-civ-spouse',
+                             alone='Married-spouse-absent', alone='Separated', alone='Widowed')
+summary(te$marital.status)
+#race
+te$race=fct_recode(te$race, minort='Amer-Indian-Eskimo', minort='Other')
+summary(te$race)
+#relationship
+table(te$marital.status, te$relationship)
+te$relationship=fct_recode(te$relationship, nochild='Husband', nochild='Not-in-family', nochild='Other-relative', nochild='Unmarried', nochild='Wife')
+summary(te$relationship)
+
+#delete country variable
+te=te[,-12]
+#complete cases
+tecmp=na.omit(te)
+(nrow(te)-nrow(tecmp))/nrow(te)
+```
+Grouping for each variable is the same. And I only keep the comlete cases since I consider this testing set a new dataset that comes later on. 
+
+## Test with complete cases model
+```{r}
+yhat.cmp.new=predict(fit.cmp, newdata = tecmp)
+confusionMatrix(data = yhat.cmp.new, tecmp$income)
+#mse
+mean((as.numeric(yhat.cmp.new) - as.numeric(tecmp$income))^2) 
+```
+
+The accuracy is $0.851$ and the $MSE$ is $0.149$.
+
+
+## Test with imputed model
+```{r}
+yhat.imp.new=predict(fit.imp, newdata = tecmp)
+confusionMatrix(data = yhat.imp.new, tecmp$income)
+#mse
+mean((as.numeric(yhat.imp.new) - as.numeric(tecmp$income))^2) 
+```
+The accuracy is $0.847$ and the $MSE$ is $0.153$.
+
+The results are still very close, but this time the complete cases model performed slightly better. In this case where the missing only takes a small portion of the whole dataset, I'd prefer using complete cases as imputation for factors is never a good strategy. 
+
+# Repeated Analysis without Aggressive Grouping
+When I look at the importance of the variables, there are things I didn't expect: for both complete and imputed, the first variable is marital status, which I thought would go lower rank. And occupation has never been on the top, which is weird as what job you have probably decides how much you make. So I started wondering if it is my grouping strategy that distorted the effects of these variables. After all, I did use a very aggressive strategy on some variables, especially on `occupation`. It seems to me that the only way to varify this is to repeat the random forest without gourping occupation and marital status. 
+
+For simplicity of the report, I will only provide the results here, and the code will be in the script file. For both complete and imputed methods, the results without aggressive grouping turn out to be a bit Worse. More precisely, with the complete method, the final test accuracy is $0.847$ and $MSE$ is $0.153$; with the imputed method, the final test accuracy is $0.845$ and $MSE$ is $0.155$. 
+
+Additionally, I have also tried logistic regression and it didn't out-perform random forest, although it came very close. Considering the time that random forest took, logistic regression might be a good option for preliminary analysis to grasp the basic idea of the data. 
